@@ -1,0 +1,15 @@
+User
+
+Rephrase the following passage so that it could be understood by someone at B1 intermediate understanding of English. Avoid words longer than 5-7 letters while preserving as much of the meaning as you can. Put the rephrased passage in <rephrase> tags <rephrase>like this</rephrase> so that it can be automatically extracted by an inference script.
+
+<passage>
+{passage}
+</passage>
+
+Try to preserve as much of the original meaning and information as possible during your rephrase while making it B1 intermediate reading level. Include all the information available in the original passage and go sentence by sentence.
+
+Assistant
+
+Sure I can do that. 
+
+<rephrase>
