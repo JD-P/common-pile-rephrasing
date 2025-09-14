@@ -19,6 +19,39 @@ rephrase_patterns = [re.compile("<rephrase>([\s\S]+)</rephrase>"),
 tokenizer = AutoTokenizer.from_pretrained("common-pile/comma-v0.1-1t")
 dataset = load_dataset("jdpressman/comma_v0.1_training_dataset_sample_1B")
 
+def length_order_and_filter_dataset(dataset):
+    items = []
+    progress = tqdm(total=len(dataset["train"]))
+    progress.set_description("Ordering dataset by length")
+    for i in range(len(dataset["train"])):
+        text = dataset["train"][i]["text"]
+        seq_len = len(text)
+        if seq_len < 50:
+            progress.update(1)
+            continue
+        # Skip samples which are not prose
+        if " " not in text:
+            progress.update(1)
+            continue
+        if ("." not in text
+            and "?" not in text
+            and "!" not in text):
+            progress.update(1)
+            continue
+        if text.startswith("SEQUENCE LISTING"):
+            progress.update(1)
+            continue
+        if text.startswith('{"type":"FeatureCollection"'):
+            progress.update(1)
+            continue
+
+        items.append((i, seq_len))
+        progress.update(1)
+    items.sort(key=lambda x: x[1])
+    return items
+
+ordered_indices = [i[0] for i in length_order_and_filter_dataset(dataset)]
+
 def estimate_tokens_per_character(dataset, tokenizer):
     ratios = []
     for i in range(1000):
@@ -39,7 +72,6 @@ def split_into_passages(
     min_tokens: int = 50
 ) -> List[str]:
     """
-    
     Split text into passages following the preprocessing rules in Pieler et al.
     https://arxiv.org/abs/2410.20796
     
@@ -56,21 +88,52 @@ def split_into_passages(
     def estimate_tokens(chunk: str) -> int:
         return int(len(chunk) * tokens_per_char)
     
+    # Helper function to split a long chunk into smaller pieces
+    def split_long_chunk(chunk: str, max_tokens: int) -> List[str]:
+        # First try to split on sentence boundaries
+        sentence_endings = r'(?<=[.!?])\s+'
+        sentences = re.split(sentence_endings, chunk)
+        
+        # If sentences are still too long, split on whitespace
+        result = []
+        for sentence in sentences:
+            if estimate_tokens(sentence) <= max_tokens:
+                result.append(sentence)
+            else:
+                # Fallback: split on whitespace
+                words = sentence.split()
+                current_chunk = []
+                current_length = 0
+                
+                for word in words:
+                    word_tokens = estimate_tokens(word)
+                    
+                    if current_length + word_tokens > max_tokens and current_chunk:
+                        result.append(' '.join(current_chunk))
+                        current_chunk = [word]
+                        current_length = word_tokens
+                    else:
+                        current_chunk.append(word)
+                        current_length += word_tokens
+                
+                if current_chunk:
+                    result.append(' '.join(current_chunk))
+        
+        return result
+    
     # Step 1: Split on line breaks
     chunks = text.split('\n')
     
     # Step 2: Remove empty passages
     chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
     
-    # Step 3: Split chunks exceeding max tokens on sentence boundaries
+    # Step 3: Split chunks exceeding max tokens
     new_chunks = []
-    sentence_endings = r'(?<=[.!?])\s+'  # Regex to split after sentence-ending punctuation
-    
     for chunk in chunks:
         if estimate_tokens(chunk) > max_tokens:
-            # Split on sentence boundaries
-            sentences = re.split(sentence_endings, chunk)
-            new_chunks.extend(sentences)
+            # Use our improved splitting function
+            split_chunks = split_long_chunk(chunk, max_tokens)
+            new_chunks.extend(split_chunks)
         else:
             new_chunks.append(chunk)
     
@@ -84,7 +147,7 @@ def split_into_passages(
     for chunk in chunks:
         chunk_tokens = estimate_tokens(chunk)
         
-        # If chunk is too long by itself, add as standalone passage
+        # If chunk is too long by itself (shouldn't happen after our improvements)
         if chunk_tokens >= max_tokens:
             if current_passage:
                 passages.append(' '.join(current_passage))
@@ -115,7 +178,7 @@ class ResultWriter:
     def __init__(self, output_file: str):
         self.output_file = output_file
         self.buffer = []
-        self.buffer_size = 50  # Write to file every 100 results
+        self.buffer_size = 5  # Write to file every 5 results
         
     async def add_result(self, result: Dict[str, Any]):
         self.buffer.append(result)
@@ -132,10 +195,13 @@ class ResultWriter:
                 f.write(json.dumps(result) + '\n')
         self.buffer.clear()
 
-async def rephrase_chunk(text: str, template_name: str, semaphore: asyncio.Semaphore) -> Dict[str, Any]:
+async def rephrase_chunk(text: str, template_name: str, semaphore: asyncio.Semaphore, index: int, tokens_per_char: float) -> Dict[str, Any]:
+    # model_name = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
+    # model_name = "Qwen/Qwen3-4B-Instruct-2507"
+    model_name = "Qwen/Qwen3-0.6B"
     async with semaphore:  # Limit concurrent requests
         payload = {
-            "model": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+            "model": model_name,
             "temperature": 1,
             "top_k": 100,
             "top_p": 1,
@@ -163,43 +229,56 @@ async def rephrase_chunk(text: str, template_name: str, semaphore: asyncio.Semap
                     
                     if rephrase is None:
                         rephrase = ""
-                        
-                    return {"text": rephrase, "template": template_name, "success": True}
+
+                    progress.update(tokens_per_char * len(rephrase))
+                    return {"index": index, "text": rephrase, "template": template_name, "success": True}
                     
             except Exception as e:
                 print(f"Error processing template {template_name}: {e}")
+                print(result)
                 return {"text": "", "template": template_name, "success": False, "error": str(e)}
 
 async def process_sample(sample: Dict[str, Any], templates: Dict[str, str], 
-                        tokens_per_char: float, semaphore: asyncio.Semaphore) -> List[Dict[str, Any]]:
+                         tokens_per_char: float, semaphore: asyncio.Semaphore, sample_idx: int) -> List[Dict[str, Any]]:
     """Process a single sample with all templates"""
+    print("Yes samples are being processed in parallel")
     # Split into passages
     passages = split_into_passages(sample, tokens_per_char=tokens_per_char)
     
     # Create all tasks for this sample
     tasks = []
     for template_name, template in templates.items():
+        index = 0
         for passage in passages:
             prompt = template.format(passage=passage)
-            tasks.append(rephrase_chunk(prompt, template_name, semaphore))
+            tasks.append(rephrase_chunk(prompt, template_name, semaphore, index, tokens_per_char))
+            index += 1
     
     # Process tasks with a timeout to prevent hanging
-    results = []
-    for task in asyncio.as_completed(tasks, timeout=300):  # 5 minute timeout per task
+    chunks = []
+    for task in asyncio.as_completed(tasks, timeout=2400):  # 40 minute timeout per task
         try:
-            result = await task
-            results.append(result)
+            chunk = await task
+            chunks.append(chunk)
         except asyncio.TimeoutError:
             print("Task timed out")
         except Exception as e:
             print(f"Task failed with error: {e}")
-    
+
+    results = []
+    for template_name in templates:
+        template_chunks = [chunk for chunk in chunks if chunk["template"] == template_name]
+        template_chunks.sort(key=lambda x: x["index"])
+        template_texts = [chunk["text"] for chunk in template_chunks]
+        results.append({"index": sample_idx, "text": " ".join(template_texts), "template": template_name}) 
     return results
 
 async def main():
     # Estimate tokens per character
     tokens_per_char = estimate_tokens_per_character(dataset, tokenizer)
+    total_tokens = sum([tokens_per_char * len(sample["text"]) for sample in dataset["train"]])
     print(f"Average Tokens Per Character: {tokens_per_char}")
+    print(f"Estimated Total Tokens: {total_tokens}")
     
     # Load templates
     templates = {}
@@ -211,22 +290,26 @@ async def main():
     writer = ResultWriter("rephrasing_results.jsonl")
     
     # Create semaphore to limit concurrent requests
-    max_concurrent_requests = 128  # Adjust based on your server capacity
+    max_concurrent_requests = 512  # Adjust based on your server capacity
     semaphore = asyncio.Semaphore(max_concurrent_requests)
     
     # Process samples with progress tracking
     total_samples = len(dataset["train"])
-    progress = tqdm(total=total_samples, desc="Rephrasing Samples")
+    global progress
+    progress = tqdm(total=total_tokens * 4, desc="Rephrasing Tokens")
     
     # Process samples in smaller batches to avoid memory issues
-    batch_size = 10
+    batch_size = 32
     for i in range(0, total_samples, batch_size):
-        batch = dataset["train"][i:i+batch_size]
+        batch = []
+        for _ in range(batch_size):
+            index = ordered_indices.pop()
+            batch.append((dataset["train"][index]["text"], index))
         
         # Create tasks for each sample in the batch
         sample_tasks = []
-        for sample in batch["text"]:
-            sample_tasks.append(process_sample(sample, templates, tokens_per_char, semaphore))
+        for sample, index in batch:
+            sample_tasks.append(process_sample(sample, templates, tokens_per_char, semaphore, index))
         
         # Process batch samples as they complete
         for task in asyncio.as_completed(sample_tasks):
@@ -235,14 +318,14 @@ async def main():
                 # Write results as they complete
                 for result in results:
                     await writer.add_result(result)
-                progress.update(1)
             except Exception as e:
                 print(f"Error processing sample: {e}")
-                progress.update(1)
     
     # Flush any remaining results
     await writer.flush()
     progress.close()
 
 if __name__ == "__main__":
+    import pdb
+    pdb.set_trace()
     asyncio.run(main())
