@@ -9,7 +9,7 @@ primary_ds = load_dataset("jdpressman/comma_v0.1_training_dataset_sample_1B_qwen
 
 # Load replay dataset and take 5% sample
 replay_ds = load_dataset("jdpressman/comma_v0.1_training_dataset_sample_1B", split="train")
-replay_ds = replay_ds.select(range(int(0.05 * len(replay_ds))))  # 5% replay:cite[4]
+# replay_ds = replay_ds.select(range(int(0.05 * len(replay_ds))))  # 5% replay:cite[4]
 
 # Combine datasets
 combined_ds = concatenate_datasets([primary_ds, replay_ds])
@@ -31,7 +31,7 @@ def tokenize_function(examples):
     tokenized["labels"] = tokenized["input_ids"].copy()
     return tokenized
 
-tokenized_ds = combined_ds.map(tokenize_function, batched=True)
+tokenized_ds = replay_ds.map(tokenize_function, batched=True)
 
 # Calculate warmup steps (1% of total steps)
 total_steps = 1000
