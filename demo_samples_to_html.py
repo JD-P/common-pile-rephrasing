@@ -52,16 +52,19 @@ for i in range(50):
         choice = random.randrange(len(dataset["train"]))
     entry = f'<div class="rephrase-set" id="{choice}">\n'
     original_text = dataset["train"][choice]["text"]
+    original_text = original_text.replace("<", "&lt;")
+    original_text = original_text.replace(">", "&gt;")
     for rephrase_idx in rephrase_index[choice]:
         entry += f'<div class="rephrase">'
         rephrasing = rephrasings[rephrase_idx]
         rephrase_text = "[" + rephrasing["template"] + "] " + rephrasing["text"]
+        rephrase_text = rephrase_text.replace("<", "&lt;")
+        rephrase_text = rephrase_text.replace(">", "&gt;")
         entry += f"<div>{original_text}</div>\n"
         entry += f"<div>{rephrase_text}</div>\n"
         entry += "</div>"
     entry += "</div>"
-    entry = entry.replace("<", "&lt;")
-    entry = entry.replace(">", "&gt;")
+    document += entry
     
 document += "</body></html>"
     
