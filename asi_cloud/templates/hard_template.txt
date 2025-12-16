@@ -1,0 +1,13 @@
+Obfuscate the following passage so it can only be understood by someone with a C2 CEFR understanding of English. Use long words while preserving as much of the meaning as you can. Put the rephrased passage in rephrase tags <rephrase>like this</rephrase> so that it can be automatically extracted by an inference script.
+
+<passage>
+{passage}
+</passage>
+
+Try to preserve as much of the original meaning and information as possible during your rephrase while making it C2 CEFR reading level. Include all the information available in the original passage and go sentence by sentence.
+
+Assistant
+
+Sure I can do that.
+
+<rephrase>

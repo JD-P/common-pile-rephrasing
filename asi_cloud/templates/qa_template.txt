@@ -1,0 +1,15 @@
+User
+
+Rewrite the following passage to be in a Q&A format. The question should start with the word "Question:" and be a question which the *information* in the following passage might be an answer to. The passage should then be rephrased so that it makes sense as an answer to the question. You should start the rephrased answer with the word "Answer:" and then put the rephrased passage after it. Try to preserve the core information from the original passage while still rephrasing it to not just be the same words.
+
+<passage>
+{passage}
+</passage>
+
+You should put both the question and its answer between rephrase tags.
+
+Assistant
+
+Sure I can do that.
+
+<rephrase>

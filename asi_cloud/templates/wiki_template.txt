@@ -1,0 +1,15 @@
+User
+
+Rewrite the following passage in an encyclopediac style as found on Wikipedia. Your rewrite should try to preserve as much of the original information as possible while rephrasing and transforming the style. If the passage is of a literary or abstract nature then do your best to interpret it in a factual and objective way.
+
+<passage>
+{passage}
+</passage>
+
+Be sure to put your answer in rephrase tags similar to the passage tags above.
+
+Assistant
+
+Sure I can do that.
+
+<rephrase>

@@ -4,6 +4,7 @@ import random
 import asyncio
 import aiohttp
 import os
+import sys
 import gzip
 import glob
 import math
@@ -12,16 +13,14 @@ from typing import List, Dict, Any
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from collections import defaultdict
+from queue import Queue
 import time
 from pathlib import Path
-
-# API configuration
-API_KEY = os.environ.get("ASI_API_KEY")
-BASE_URL = "https://inference.asicloud.cudos.org/v1"
-MODEL = "mistralai/mistral-nemo"
+from argparse import ArgumentParser
+from text_processing import TextProcessor
 
 # Common assistant response prefix
-ASSISTANT_PREFIX = "Sure I can do that.\n\n<rephrase>\n"
+ASSISTANT_PREFIX = "/no_think Sure I can do that.\n\n<rephrase>\n"
 
 # Rephrasing templates
 TEMPLATES = [
@@ -71,12 +70,6 @@ Try to preserve as much of the original meaning and information as possible duri
     }
 ]
 
-# Initialize tokenizer
-tokenizer = AutoTokenizer.from_pretrained("common-pile/comma-v0.1-1t")
-
-def compute_md5(text: str) -> str:
-    """Compute MD5 hex digest of text"""
-    return hashlib.md5(text.encode('utf-8')).hexdigest()
 
 class ShardedResultWriter:
     def __init__(self, output_dir: str, shard_size: int = 250 * (10 ** 6)):
@@ -210,131 +203,7 @@ def load_few_shot_examples(template_prefix):
     
     return all_messages
 
-def extract_rephrased_text(response_text):
-    """Extract content between <rephrase> tags using regex with multiple patterns"""
-    patterns = [
-        re.compile(r'<rephrase>\n?(.*?)\n?</rephrase>', re.DOTALL),
-        re.compile(r'<rephrase>([\s\S]+)</rephrase>'),
-        re.compile(r'<rephrase>([\s\S]+)<rephrase>'),
-        re.compile(r'<rephrase>([\s\S]+)</passage>'),
-        re.compile(r'<rephrase>([\s\S]+)<passage>'),
-        re.compile(r'<rephrase>([\s\S]+)</r')
-    ]
-    
-    for pattern in patterns:
-        match = pattern.search(response_text)
-        if match:
-            return match.group(1).strip()
-    
-    # If no tags found, return ellipsis to indicate missing content
-    return "…"
 
-def estimate_tokens_per_character(sample_texts):
-    """Estimate tokens per character using the comma tokenizer"""
-    ratios = []
-    for text in sample_texts[:1000]:  # Use first 1000 samples for estimation
-        if not text:
-            continue
-        char_len = len(text)
-        token_len = len(tokenizer(text)["input_ids"])
-        try:
-            ratios.append(token_len / char_len)
-        except:
-            ratios.append(0)
-    return sum(ratios) / len(ratios) if ratios else 0.25
-
-def split_into_passages(
-    text: str,
-    max_tokens: int = 350,
-    tokens_per_char: float = 0.25,
-    min_tokens: int = 50
-) -> List[str]:
-    """
-    Split text into passages following the preprocessing rules in Pieler et al.
-    """
-    def estimate_tokens(chunk: str) -> int:
-        return int(len(chunk) * tokens_per_char)
-    
-    def split_long_chunk(chunk: str, max_tokens: int) -> List[str]:
-        # First try to split on sentence boundaries
-        sentence_endings = r'(?<=[.!?])\s+'
-        sentences = re.split(sentence_endings, chunk)
-        
-        # If sentences are still too long, split on whitespace
-        result = []
-        for sentence in sentences:
-            if estimate_tokens(sentence) <= max_tokens:
-                result.append(sentence)
-            else:
-                # Fallback: split on whitespace
-                words = sentence.split()
-                current_chunk = []
-                current_length = 0
-                
-                for word in words:
-                    word_tokens = estimate_tokens(word)
-                    
-                    if current_length + word_tokens > max_tokens and current_chunk:
-                        result.append(' '.join(current_chunk))
-                        current_chunk = [word]
-                        current_length = word_tokens
-                    else:
-                        current_chunk.append(word)
-                        current_length += word_tokens
-                
-                if current_chunk:
-                    result.append(' '.join(current_chunk))
-        
-        return result
-    
-    # Step 1: Split on line breaks
-    chunks = text.split('\n')
-    
-    # Step 2: Remove empty passages
-    chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
-    
-    # Step 3: Split chunks exceeding max tokens
-    new_chunks = []
-    for chunk in chunks:
-        if estimate_tokens(chunk) > max_tokens:
-            split_chunks = split_long_chunk(chunk, max_tokens)
-            new_chunks.extend(split_chunks)
-        else:
-            new_chunks.append(chunk)
-    
-    chunks = new_chunks
-    
-    # Step 4: Merge consecutive passages
-    passages = []
-    current_passage = []
-    current_length = 0
-    
-    for chunk in chunks:
-        chunk_tokens = estimate_tokens(chunk)
-        
-        if chunk_tokens >= max_tokens:
-            if current_passage:
-                passages.append(' '.join(current_passage))
-                current_passage = []
-                current_length = 0
-            passages.append(chunk)
-            continue
-            
-        if current_length + chunk_tokens > max_tokens:
-            if current_passage:
-                passages.append(' '.join(current_passage))
-                current_passage = []
-                current_length = 0
-                
-        current_passage.append(chunk)
-        current_length += chunk_tokens
-    
-    if current_passage:
-        final_passage = ' '.join(current_passage)
-        if estimate_tokens(final_passage) >= min_tokens:
-            passages.append(final_passage)
-    
-    return passages
 
 async def send_rephrase_request(session, template_name, user_message, few_shot_messages, max_retries=3):
     """Send a single rephrase request to the API with few-shot examples and retries"""
@@ -367,7 +236,8 @@ async def send_rephrase_request(session, template_name, user_message, few_shot_m
                 if response.status == 200:
                     data = await response.json()
                     full_response = data["choices"][0]["message"]["content"]
-                    rephrased_text = extract_rephrased_text(full_response)
+                    print(full_response)
+                    rephrased_text = TextProcessor.extract_rephrased_text(ASSISTANT_PREFIX + full_response)
                     
                     # If we got empty content but it's not the ellipsis, retry
                     if not rephrased_text and attempt < max_retries - 1:
@@ -390,28 +260,26 @@ async def send_rephrase_request(session, template_name, user_message, few_shot_m
     
     return template_name, "…", False
 
-async def rephrase_chunk(passage: str, template: Dict, semaphore: asyncio.Semaphore, tokens_per_char: float) -> Dict[str, Any]:
+async def rephrase_chunk(md5: str, index: int, passage: str, template: Dict, tokens_per_char: float) -> Dict[str, Any]:
     """Rephrase a single passage using the specified template"""
-    async with semaphore:
-        # Load few-shot examples for this template
-        few_shot_messages = load_few_shot_examples(template["prefix"])
-        
-        formatted_user_message = template["user_message"].format(passage=passage)
-        
-        async with aiohttp.ClientSession() as session:
-            template_name, rephrased_text, success = await send_rephrase_request(
-                session, template["name"], formatted_user_message, few_shot_messages
-            )
-            
-            return {
-                "template": template_name,
-                "original_passage": passage,
-                "original_passage_md5": compute_md5(passage),
-                "rephrased_text": rephrased_text,
-                "rephrased_text_md5": compute_md5(rephrased_text),
-                "success": success,
-                "estimated_tokens": int(len(rephrased_text) * tokens_per_char)
-            }
+    # Load few-shot examples for this template
+    few_shot_messages = load_few_shot_examples(template["prefix"])
+
+    formatted_user_message = template["user_message"].format(passage=passage)
+
+    async with aiohttp.ClientSession() as session:
+        template_name, rephrased_text, success = await send_rephrase_request(
+            session, template["name"], formatted_user_message, few_shot_messages
+        )
+
+        return {
+            "md5": md5,
+            "index": index,
+            "template": template["prefix"],
+            "rephrased_text": rephrased_text,
+            "success": success,
+            "estimated_tokens": int(len(rephrased_text) * tokens_per_char)
+        }
 
 async def process_document(doc: Dict[str, Any], tokens_per_char: float, semaphore: asyncio.Semaphore) -> List[Dict[str, Any]]:
     """Process a single document through all templates"""
@@ -420,10 +288,10 @@ async def process_document(doc: Dict[str, Any], tokens_per_char: float, semaphor
         return []
     
     # Compute MD5 of original document text
-    original_text_md5 = compute_md5(original_text)
+    original_text_md5 = TextProcessor.compute_md5(original_text)
     
     # Split document into passages
-    passages = split_into_passages(original_text, tokens_per_char=tokens_per_char)
+    passages = TextProcessor.split_into_passages(original_text, tokens_per_char=tokens_per_char)
     if not passages:
         return []
     
@@ -453,7 +321,7 @@ async def process_document(doc: Dict[str, Any], tokens_per_char: float, semaphor
         template_passages.sort(key=lambda x: x.get("original_passage", ""))
         
         combined_text = " ".join([r["rephrased_text"] for r in template_passages])
-        total_tokens = sum([r.get("estimated_tokens", 0) for r in template_passages])
+        
         
         # Create output document with original metadata
         output_doc = {
@@ -468,7 +336,7 @@ async def process_document(doc: Dict[str, Any], tokens_per_char: float, semaphor
             "processing_timestamp": time.time(),
             # Add MD5 digests
             "original_text_md5": original_text_md5,
-            "rephrased_text_md5": compute_md5(combined_text)
+            "rephrased_text_md5": TextProcessor.compute_md5(combined_text)
         }
         
         template_results[template_name] = output_doc
@@ -493,14 +361,115 @@ def read_gzipped_jsonl_files(data_dir: str):
                     except json.JSONDecodeError:
                         continue
 
+class CommonPileLowCodeLoader:
+    def __init__(self, data_dir):
+        self.shard_paths = [os.path.join(data_dir, path)
+                            for path in os.listdir(data_dir)
+                            if path.endswith(".jsonl.gz")]
+        self.documents = []
+        self.until_refill = 0
+
+    async def setup(self):
+        await self._add_documents_from_shard()
+        await self._add_documents_from_shard()
+        
+    async def _add_documents_from_shard(self):
+        dcount = 0
+        path = self.shard_paths.pop()
+        with gzip.open(path, 'rt', encoding='utf-8') as infile:
+            for line in infile:
+                if line.strip():
+                    try:
+                        self.documents.append(json.loads(line))
+                        dcount += 1
+                    except json.JSONDecodeError as e:
+                        print(e)
+                        continue
+        self.until_refill += (dcount // 2)
+        return dcount
+
+    async def fill_queue(self, q):
+        putn = q.maxsize - q.qsize()
+        if putn:
+            for i in range(putn):
+                try:
+                    q.put(self.documents.pop())
+                except IndexError:
+                    await self._add_documents_from_shard()
+                    q.put(self.documents.pop())
+                self.until_refill -= 1
+            if self.until_refill <= 0:
+                self.until_refill = 0
+                await self._add_documents_from_shard()
+
+class RephraseAccumulator:
+    def __init__(self):
+        self.wip_rephrasings = {}
+
+    def register_doc(self, doc):
+        self.wip_rephrasings[(doc["md5"], doc["template"])] = {
+            "chunks":[],
+            "expected_chunks":doc["chunk_count"],
+            "original_text": doc["text"],
+            "template": doc["template"],
+            "source": doc["source"],
+            "metadata": doc["metadata"],
+            "source_specific_keys": doc["source_specific_keys"],
+        }
+            
+    def add_chunk(self, chunk):
+        wip = self.wip_rephrasings[(chunk["md5"], chunk["template"])]
+        wip["chunks"].append(chunk)
+        if len(wip["chunks"]) >= wip["expected_chunks"]:
+            wip["chunks"].sort(key=lambda chunk: chunk["index"])
+            combined_text = " ".join([c["rephrased_text"] for c in wip["chunks"]])
+            total_tokens = sum([r.get("estimated_tokens", 0)
+                                for r in wip["chunks"]])
+            doc = wip
+            original_text = doc["original_text"]
+            output_doc = {
+                "source": doc.get("source", ""),
+                "metadata": doc.get("metadata", {}),
+                "text": combined_text,
+                "template": doc.get("template", ""),
+                "original_length": len(original_text),
+                "rephrased_length": len(combined_text),
+                "estimated_tokens": total_tokens,
+                "source_specific_keys": doc.get("source_specific_keys", ""),
+                "processing_timestamp": time.time(),
+                # Add MD5 digests
+                "original_text_md5": chunk["md5"],
+                "rephrased_text_md5": TextProcessor.compute_md5(combined_text)
+            }
+        else:
+            output_doc = None
+        if output_doc:
+            del self.wip_rephrasings[(chunk["md5"], chunk["template"])]
+        return output_doc
+                
 async def main():
+    parser = ArgumentParser()
+    parser.add_argument("--api-key")
+    parser.add_argument("--base-url")
+    parser.add_argument("--model", default="qwen--qwen3-4b")
+    parser.add_argument("--data-dir", default="../common_pile_low_code")
+    parser.add_argument("--output-dir", default="rephrased_shards")
+    args = parser.parse_args()
+    # API configuration
+    global API_KEY
+    API_KEY = args.api_key
+    global BASE_URL
+    BASE_URL = args.base_url
+    global MODEL
+    MODEL = args.model
+    
     if not API_KEY:
         print("Error: ASI_API_KEY environment variable is not set")
         sys.exit(1)
     
     # Data directory
-    data_dir = "common_pile_low_code"
-    output_dir = "nemo_rephrased_shards"
+    data_dir = args.data_dir
+    output_dir = args.output_dir
     
     # Estimate tokens per character using sample data
     print("Estimating tokens per character...")
@@ -512,78 +481,94 @@ async def main():
         if doc.get("text"):
             sample_texts.append(doc["text"])
             sample_count += 1
-    
-    tokens_per_char = estimate_tokens_per_character(sample_texts)
+
+    tokenizer = AutoTokenizer.from_pretrained("common-pile/comma-v0.1-1t")
+    tp = TextProcessor(tokenizer)
+    tokens_per_char = tp.estimate_tokens_per_character(sample_texts)
     print(f"Estimated tokens per character: {tokens_per_char:.4f}")
     
     # Initialize sharded result writer
     writer = ShardedResultWriter(output_dir, shard_size=250 * (10 ** 6))
-    
-    # Create semaphore to limit concurrent requests
-    max_concurrent_requests = 20  # Adjust based on API limits
-    semaphore = asyncio.Semaphore(max_concurrent_requests)
-    
+        
     # Process documents with progress tracking
     total_docs = 0
-    for _ in read_gzipped_jsonl_files(data_dir):
+    total_tokens = 0
+    for doc in read_gzipped_jsonl_files(data_dir):
         total_docs += 1
+        total_tokens += tokens_per_char * len(doc["text"]) * 4
+    # Round for aesthetic purposes
+    total_tokens = int(total_tokens)
     
-    print(f"Processing {total_docs} documents...")
-    
-    # Reset generator
-    document_generator = read_gzipped_jsonl_files(data_dir)
+    print(f"Processing {total_docs} documents with {total_tokens} tokens...")
+
+    dataloader = CommonPileLowCodeLoader(data_dir)
+    await dataloader.setup()
     
     # Global progress bar for documents
-    doc_progress = tqdm(total=total_docs, desc="Documents")
+    progress = tqdm(total=total_tokens, desc="Tokens")
     
-    # Process documents in batches
-    batch_size = 10
     processed_count = 0
-    
-    while processed_count < total_docs:
-        batch_docs = []
-        for _ in range(batch_size):
-            try:
-                doc = next(document_generator)
-                batch_docs.append(doc)
-            except StopIteration:
-                break
-        
-        if not batch_docs:
-            break
-        
-        # Create tasks for each document in batch
-        tasks = []
-        for doc in batch_docs:
-            task = process_document(doc, tokens_per_char, semaphore)
-            tasks.append(task)
-        
-        # Process batch
-        for task in asyncio.as_completed(tasks):
-            try:
-                results = await task
-                # Write results
-                for result in results:
-                    await writer.add_result(result)
-                
-                doc_progress.update(1)
+
+    rp = RephraseAccumulator()
+    # docs2rephrase exists so we never wait on I/O to read docs
+    docs2rephrase = Queue(maxsize=16)
+    chunks2rephrase = Queue()
+    rephrase_jobs = Queue()
+    while dataloader.shard_paths:
+        if chunks2rephrase.qsize() < 1024:
+            await dataloader.fill_queue(docs2rephrase)
+            doc = docs2rephrase.get()
+            if not doc["text"] or len(doc["text"].strip()) < 50:
+                continue
+            passages = TextProcessor.split_into_passages(
+                doc["text"],
+                tokens_per_char=tokens_per_char
+            )
+            if not passages:
+                continue
+            doc["md5"] = TextProcessor.compute_md5(doc["text"])
+            doc["chunk_count"] = len(passages)
+            for template in TEMPLATES:
+                rp.register_doc(doc | {"template":template["prefix"]})
+            for i, passage in enumerate(passages):
+                # TODO: Remove this
+                assert type(passage) == str
+                chunk = {"index": i,
+                         "md5": doc["md5"],
+                         "text": passage}
+                chunks2rephrase.put(chunk)
+        if chunks2rephrase.qsize() >= 128 and rephrase_jobs.qsize() <= 128:
+            for i in range(32):
+                chunk = chunks2rephrase.get()
+                for template in TEMPLATES:
+                    rephrase_jobs.put(
+                        rephrase_chunk(chunk["md5"],
+                                       chunk["index"],
+                                       chunk["text"],
+                                       template,
+                                       tokens_per_char)
+                    )
+        if not rephrase_jobs.empty():
+            print("Making attempt...")
+            current_job = rephrase_jobs.get()
+            rephrased_chunk = await current_job
+            completed = rp.add_chunk(rephrased_chunk)
+            if completed:
+                rephrased_doc = completed
+                await writer.add_result(rephrased_doc)
                 processed_count += 1
-                
-                # Update progress description
-                doc_progress.set_description(f"Documents ({processed_count}/{total_docs}) - Shard {writer.shard_index}")
-                
-            except Exception as e:
-                print(f"Error processing document: {e}")
-                doc_progress.update(1)
-                processed_count += 1
-        
-        # Small delay between batches to avoid overwhelming the API
-        await asyncio.sleep(1)
-    
+                progress.set_description(f"Documents ({processed_count}/{total_docs}) - Shard {writer.shard_index}")
+            progress.update(rephrased_chunk["estimated_tokens"])
+            
+            print(rephrased_chunk)
+
+        # Update progress description
+        # 
+ 
     # Flush any remaining results and close writer
     await writer.flush()
     writer.close()
-    doc_progress.close()
+    progress.close()
     
     print(f"Rephrasing completed! Output saved to {output_dir}/")
 
