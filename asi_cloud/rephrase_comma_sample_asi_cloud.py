@@ -209,7 +209,8 @@ async def send_rephrase_request(session, template_name, user_message, few_shot_m
     """Send a single rephrase request to the API with few-shot examples and retries"""
     headers = {
         "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "routing-strategy": "prefix-cache-preble",
     }
     
     # Build proper ChatML messages: few-shot examples + current request
@@ -230,13 +231,14 @@ async def send_rephrase_request(session, template_name, user_message, few_shot_m
     
     for attempt in range(max_retries):
         try:
+            # TODO: Turn SSL back on(?)
             async with session.post(f"{BASE_URL}/chat/completions", 
-                                  json=payload, headers=headers) as response:
-                
+                                    json=payload, headers=headers, ssl=False) as response:
+                print(response)
                 if response.status == 200:
                     data = await response.json()
                     full_response = data["choices"][0]["message"]["content"]
-                    print(full_response)
+                    print(data)
                     rephrased_text = TextProcessor.extract_rephrased_text(ASSISTANT_PREFIX + full_response)
                     
                     # If we got empty content but it's not the ellipsis, retry
