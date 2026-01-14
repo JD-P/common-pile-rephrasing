@@ -20,7 +20,7 @@ from argparse import ArgumentParser
 from text_processing import TextProcessor
 
 # Common assistant response prefix
-ASSISTANT_PREFIX = "/no_think Sure I can do that.\n\n<rephrase>\n"
+ASSISTANT_PREFIX = "/no_think Sure I can do that.\n\n"
 
 # Rephrasing templates
 TEMPLATES = [
@@ -114,6 +114,7 @@ class ShardedResultWriter:
     
     async def add_result(self, result: Dict[str, Any]):
         """Add a result to the current shard, creating new shard if needed"""
+        print(result)
         # Estimate tokens for this result
         result_tokens = result.get('estimated_tokens', 0)
         
@@ -195,6 +196,7 @@ def load_few_shot_examples(template_prefix):
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 if 'messages' in data:
+                    # data["messages"][-1]["content"] = ASSISTANT_PREFIX + data["messages"][-1]["content"]
                     all_messages.extend(data['messages'])
                 else:
                     print(f"Warning: File {filename} does not contain 'messages' key")
@@ -205,10 +207,11 @@ def load_few_shot_examples(template_prefix):
 
 
 
-async def send_rephrase_request(session, template_name, user_message, few_shot_messages, max_retries=3):
+async def send_rephrase_request(session, template_name, user_message, assistant_message, few_shot_messages, max_retries=3):
     """Send a single rephrase request to the API with few-shot examples and retries"""
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Basic {API_KEY}",
+        # "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
         "routing-strategy": "prefix-cache-preble",
     }
@@ -218,7 +221,7 @@ async def send_rephrase_request(session, template_name, user_message, few_shot_m
     messages.extend(few_shot_messages)
     messages.extend([
         {"role": "user", "content": user_message},
-        {"role": "assistant", "content": ASSISTANT_PREFIX}
+        {"role": "assistant", "content": assistant_message}
     ])
     
     payload = {
@@ -231,16 +234,12 @@ async def send_rephrase_request(session, template_name, user_message, few_shot_m
     
     for attempt in range(max_retries):
         try:
-            # TODO: Turn SSL back on(?)
             async with session.post(f"{BASE_URL}/chat/completions", 
-                                    json=payload, headers=headers, ssl=False) as response:
-                print(response)
+                                    json=payload, headers=headers) as response:
                 if response.status == 200:
                     data = await response.json()
                     full_response = data["choices"][0]["message"]["content"]
-                    print(data)
-                    rephrased_text = TextProcessor.extract_rephrased_text(ASSISTANT_PREFIX + full_response)
-                    
+                    rephrased_text = TextProcessor.extract_rephrased_text(ASSISTANT_PREFIX + full_response)                    
                     # If we got empty content but it's not the ellipsis, retry
                     if not rephrased_text and attempt < max_retries - 1:
                         await asyncio.sleep(1)  # Brief delay before retry
@@ -268,10 +267,15 @@ async def rephrase_chunk(md5: str, index: int, passage: str, template: Dict, tok
     few_shot_messages = load_few_shot_examples(template["prefix"])
 
     formatted_user_message = template["user_message"].format(passage=passage)
-
+    # Prefill with first word of passage to prevent goobers
+    if template["prefix"] == "qa":
+        assistant_message = ASSISTANT_PREFIX + "<rephrase>\n" + "Question:"
+    else:
+        assistant_message = ASSISTANT_PREFIX + "<rephrase>\n" + passage.split()[0]
+    
     async with aiohttp.ClientSession() as session:
         template_name, rephrased_text, success = await send_rephrase_request(
-            session, template["name"], formatted_user_message, few_shot_messages
+            session, template["name"], formatted_user_message, assistant_message, few_shot_messages
         )
 
         return {
@@ -364,18 +368,27 @@ def read_gzipped_jsonl_files(data_dir: str):
                         continue
 
 class CommonPileLowCodeLoader:
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, start=0, end=float('inf')):
         self.shard_paths = [os.path.join(data_dir, path)
                             for path in os.listdir(data_dir)
                             if path.endswith(".jsonl.gz")]
+        # Ensure consistent ordering
+        self.shard_paths.sort()
+        for i in range(start):
+            self.shard_paths.pop()
+        assert self.shard_paths
         self.documents = []
         self.until_refill = 0
+        self.until_stop = end
 
     async def setup(self):
         await self._add_documents_from_shard()
         await self._add_documents_from_shard()
         
     async def _add_documents_from_shard(self):
+        if self.until_stop <= 0:
+            self.shard_paths = []
+            return 0
         dcount = 0
         path = self.shard_paths.pop()
         with gzip.open(path, 'rt', encoding='utf-8') as infile:
@@ -388,6 +401,7 @@ class CommonPileLowCodeLoader:
                         print(e)
                         continue
         self.until_refill += (dcount // 2)
+        self.until_stop -= 1
         return dcount
 
     async def fill_queue(self, q):
@@ -397,8 +411,9 @@ class CommonPileLowCodeLoader:
                 try:
                     q.put(self.documents.pop())
                 except IndexError:
-                    await self._add_documents_from_shard()
-                    q.put(self.documents.pop())
+                    dcount = await self._add_documents_from_shard()
+                    if dcount:
+                        q.put(self.documents.pop())
                 self.until_refill -= 1
             if self.until_refill <= 0:
                 self.until_refill = 0
@@ -544,14 +559,15 @@ async def main():
                 chunk = chunks2rephrase.get()
                 for template in TEMPLATES:
                     rephrase_jobs.put(
-                        rephrase_chunk(chunk["md5"],
-                                       chunk["index"],
-                                       chunk["text"],
-                                       template,
-                                       tokens_per_char)
+                        asyncio.create_task(
+                            rephrase_chunk(chunk["md5"],
+                                           chunk["index"],
+                                           chunk["text"],
+                                           template,
+                                           tokens_per_char)
+                        )
                     )
         if not rephrase_jobs.empty():
-            print("Making attempt...")
             current_job = rephrase_jobs.get()
             rephrased_chunk = await current_job
             completed = rp.add_chunk(rephrased_chunk)
@@ -562,7 +578,7 @@ async def main():
                 progress.set_description(f"Documents ({processed_count}/{total_docs}) - Shard {writer.shard_index}")
             progress.update(rephrased_chunk["estimated_tokens"])
             
-            print(rephrased_chunk)
+            # print(rephrased_chunk)
 
         # Update progress description
         # 

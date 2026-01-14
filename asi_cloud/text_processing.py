@@ -29,8 +29,12 @@ class TextProcessor:
             if match:
                 return match.group(1).strip()
 
-        # If no tags found, return ellipsis to indicate missing content
-        return "…"
+        if response_text.endswith("."):
+            guess = response_text.replace("/no_think Sure I can do that.\n\n", "")
+            return guess.split("<rephrase>")[-1].strip()
+        else:
+            # If no tags found, return ellipsis to indicate missing content
+            return "…"
 
     def estimate_tokens_per_character(self, sample_texts):
         """Estimate tokens per character using the comma tokenizer"""
