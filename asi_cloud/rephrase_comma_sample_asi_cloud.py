@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from argparse import ArgumentParser
 from text_processing import TextProcessor
+from common_pile_low_code_loader import CommonPileLowCodeLoader
 
 # Common assistant response prefix
 ASSISTANT_PREFIX = "/no_think Sure I can do that.\n\n"
@@ -287,68 +288,6 @@ async def rephrase_chunk(md5: str, index: int, passage: str, template: Dict, tok
             "estimated_tokens": int(len(rephrased_text) * tokens_per_char)
         }
 
-async def process_document(doc: Dict[str, Any], tokens_per_char: float, semaphore: asyncio.Semaphore) -> List[Dict[str, Any]]:
-    """Process a single document through all templates"""
-    original_text = doc.get("text", "")
-    if not original_text or len(original_text.strip()) < 50:
-        return []
-    
-    # Compute MD5 of original document text
-    original_text_md5 = TextProcessor.compute_md5(original_text)
-    
-    # Split document into passages
-    passages = TextProcessor.split_into_passages(original_text, tokens_per_char=tokens_per_char)
-    if not passages:
-        return []
-    
-    # Create tasks for all passages and templates
-    tasks = []
-    for passage in passages:
-        for template in TEMPLATES:
-            task = rephrase_chunk(passage, template, semaphore, tokens_per_char)
-            tasks.append(task)
-    
-    # Process all tasks with timeout
-    results = []
-    for task in asyncio.as_completed(tasks, timeout=1200):  # 20 minute timeout
-        try:
-            result = await task
-            results.append(result)
-        except asyncio.TimeoutError:
-            print("Task timed out")
-        except Exception as e:
-            print(f"Task failed with error: {e}")
-    
-    # Group results by template and combine
-    template_results = {}
-    for template in TEMPLATES:
-        template_name = template["name"]
-        template_passages = [r for r in results if r["template"] == template_name]
-        template_passages.sort(key=lambda x: x.get("original_passage", ""))
-        
-        combined_text = " ".join([r["rephrased_text"] for r in template_passages])
-        
-        
-        # Create output document with original metadata
-        output_doc = {
-            "source": doc.get("source", ""),
-            "metadata": doc.get("metadata", {}),
-            "text": combined_text,
-            "template": template_name,
-            "original_length": len(original_text),
-            "rephrased_length": len(combined_text),
-            "estimated_tokens": total_tokens,
-            "source_specific_keys": doc.get("source_specific_keys", ""),
-            "processing_timestamp": time.time(),
-            # Add MD5 digests
-            "original_text_md5": original_text_md5,
-            "rephrased_text_md5": TextProcessor.compute_md5(combined_text)
-        }
-        
-        template_results[template_name] = output_doc
-    
-    return list(template_results.values())
-
 def read_gzipped_jsonl_files(data_dir: str):
     """Read all gzipped JSONL files from the data directory"""
     pattern = os.path.join(data_dir, "*.jsonl.gz")
@@ -366,58 +305,6 @@ def read_gzipped_jsonl_files(data_dir: str):
                         yield json.loads(line)
                     except json.JSONDecodeError:
                         continue
-
-class CommonPileLowCodeLoader:
-    def __init__(self, data_dir, start=0, end=float('inf')):
-        self.shard_paths = [os.path.join(data_dir, path)
-                            for path in os.listdir(data_dir)
-                            if path.endswith(".jsonl.gz")]
-        # Ensure consistent ordering
-        self.shard_paths.sort()
-        for i in range(start):
-            self.shard_paths.pop()
-        assert self.shard_paths
-        self.documents = []
-        self.until_refill = 0
-        self.until_stop = end
-
-    async def setup(self):
-        await self._add_documents_from_shard()
-        await self._add_documents_from_shard()
-        
-    async def _add_documents_from_shard(self):
-        if self.until_stop <= 0:
-            self.shard_paths = []
-            return 0
-        dcount = 0
-        path = self.shard_paths.pop()
-        with gzip.open(path, 'rt', encoding='utf-8') as infile:
-            for line in infile:
-                if line.strip():
-                    try:
-                        self.documents.append(json.loads(line))
-                        dcount += 1
-                    except json.JSONDecodeError as e:
-                        print(e)
-                        continue
-        self.until_refill += (dcount // 2)
-        self.until_stop -= 1
-        return dcount
-
-    async def fill_queue(self, q):
-        putn = q.maxsize - q.qsize()
-        if putn:
-            for i in range(putn):
-                try:
-                    q.put(self.documents.pop())
-                except IndexError:
-                    dcount = await self._add_documents_from_shard()
-                    if dcount:
-                        q.put(self.documents.pop())
-                self.until_refill -= 1
-            if self.until_refill <= 0:
-                self.until_refill = 0
-                await self._add_documents_from_shard()
 
 class RephraseAccumulator:
     def __init__(self):
@@ -463,7 +350,28 @@ class RephraseAccumulator:
         if output_doc:
             del self.wip_rephrasings[(chunk["md5"], chunk["template"])]
         return output_doc
-                
+
+def process_document(doc, tokens_per_char, accumulator):
+    if not doc["text"] or len(doc["text"].strip()) < 50:
+        continue
+    passages = TextProcessor.split_into_passages(
+                doc["text"],
+                tokens_per_char=tokens_per_char
+            )
+    if not passages:
+        continue
+    doc["md5"] = TextProcessor.compute_md5(doc["text"])
+    doc["chunk_count"] = len(passages)
+    for template in TEMPLATES:
+        accumulator.register_doc(doc | {"template":template["prefix"]})
+    chunks = []
+    for i, passage in enumerate(passages):
+        chunk = {"index": i,
+                 "md5": doc["md5"],
+                 "text": passage}
+        chunks.append(chunk)
+    return chunks
+        
 async def main():
     parser = ArgumentParser()
     parser.add_argument("--api-key")
@@ -535,24 +443,8 @@ async def main():
         if chunks2rephrase.qsize() < 1024:
             await dataloader.fill_queue(docs2rephrase)
             doc = docs2rephrase.get()
-            if not doc["text"] or len(doc["text"].strip()) < 50:
-                continue
-            passages = TextProcessor.split_into_passages(
-                doc["text"],
-                tokens_per_char=tokens_per_char
-            )
-            if not passages:
-                continue
-            doc["md5"] = TextProcessor.compute_md5(doc["text"])
-            doc["chunk_count"] = len(passages)
-            for template in TEMPLATES:
-                rp.register_doc(doc | {"template":template["prefix"]})
-            for i, passage in enumerate(passages):
-                # TODO: Remove this
-                assert type(passage) == str
-                chunk = {"index": i,
-                         "md5": doc["md5"],
-                         "text": passage}
+            chunks = process_document(doc, tokens_per_char, rp)
+            for chunk in chunks:
                 chunks2rephrase.put(chunk)
         if chunks2rephrase.qsize() >= 128 and rephrase_jobs.qsize() <= 128:
             for i in range(32):
@@ -582,7 +474,36 @@ async def main():
 
         # Update progress description
         # 
- 
+    print("Finishing up...")
+    while docs2rephrase.qsize():
+        doc = docs2rephrase.get()
+        chunks = process_document(doc, tokens_per_char, rp)
+        for chunk in chunks:
+            chunks2rephrase.put(chunk)
+    while chunks2rephrase.qsize():
+        batch_size = 32 if chunks2rephrase.qsize() > 32 else chunks2rephrase.qsize()
+        for i in range(batch_size):
+            chunk = chunks2rephrase.get()
+            for template in TEMPLATES:
+                rephrase_jobs.put(
+                    asyncio.create_task(
+                        rephrase_chunk(chunk["md5"],
+                                       chunk["index"],
+                                       chunk["text"],
+                                       template,
+                                       tokens_per_char)
+                    )
+                )
+        while not rephrase_jobs.empty():
+            current_job = rephrase_jobs.get()
+            rephrased_chunk = await current_job
+            completed = rp.add_chunk(rephrased_chunk)
+            if completed:
+                rephrased_doc = completed
+                await writer.add_result(rephrased_doc)
+                processed_count += 1
+                progress.set_description(f"Documents ({processed_count}/{total_docs}) - Shard {writer.shard_index}")
+            progress.update(rephrased_chunk["estimated_tokens"])
     # Flush any remaining results and close writer
     await writer.flush()
     writer.close()
