@@ -73,11 +73,11 @@ Try to preserve as much of the original meaning and information as possible duri
 
 
 class ShardedResultWriter:
-    def __init__(self, output_dir: str, shard_size: int = 250 * (10 ** 6)):
+    def __init__(self, output_dir: str, shard_size: int = 250 * (10 ** 6), start: int = 0):
         self.output_dir = Path(output_dir)
         self.shard_size = shard_size
         self.current_shard_tokens = 0
-        self.shard_index = 0
+        self.shard_index = int(start)
         self.current_file = None
         
         # Create output directory if it doesn't exist
@@ -85,12 +85,12 @@ class ShardedResultWriter:
         
         # Resume from checkpoint if exists
         self.resume_file = self.output_dir / "rephrasing_resume.json"
-        if self.resume_file.exists():
-            with open(self.resume_file, 'r') as f:
-                data = json.load(f)
-                self.current_shard_tokens = data.get("current_shard_tokens", 0)
-                self.shard_index = data.get("shard_index", 0)
-                print(f"Resumed from checkpoint: shard {self.shard_index}, {self.current_shard_tokens} tokens")
+        # if self.resume_file.exists():
+        #    with open(self.resume_file, 'r') as f:
+        #        data = json.load(f)
+        #        self.current_shard_tokens = data.get("current_shard_tokens", 0)
+        #        self.shard_index = data.get("shard_index", 0)
+        #        print(f"Resumed from checkpoint: shard {self.shard_index}, {self.current_shard_tokens} tokens")
         
         self._open_current_shard()
     
@@ -353,13 +353,13 @@ class RephraseAccumulator:
 
 def process_document(doc, tokens_per_char, accumulator):
     if not doc["text"] or len(doc["text"].strip()) < 50:
-        continue
+        return []
     passages = TextProcessor.split_into_passages(
                 doc["text"],
                 tokens_per_char=tokens_per_char
             )
     if not passages:
-        continue
+        return []
     doc["md5"] = TextProcessor.compute_md5(doc["text"])
     doc["chunk_count"] = len(passages)
     for template in TEMPLATES:
@@ -379,6 +379,8 @@ async def main():
     parser.add_argument("--model", default="qwen--qwen3-4b")
     parser.add_argument("--data-dir", default="../common_pile_low_code")
     parser.add_argument("--output-dir", default="rephrased_shards")
+    parser.add_argument("--start-after", default=0, type=int)
+    parser.add_argument("--end", default=float('inf'), type=float)
     args = parser.parse_args()
     # API configuration
     global API_KEY
@@ -413,20 +415,36 @@ async def main():
     print(f"Estimated tokens per character: {tokens_per_char:.4f}")
     
     # Initialize sharded result writer
-    writer = ShardedResultWriter(output_dir, shard_size=250 * (10 ** 6))
+    writer = ShardedResultWriter(output_dir, shard_size=250 * (10 ** 6), start=args.start_after)
         
-    # Process documents with progress tracking
+    # Estimate document and token counts
     total_docs = 0
     total_tokens = 0
-    for doc in read_gzipped_jsonl_files(data_dir):
-        total_docs += 1
-        total_tokens += tokens_per_char * len(doc["text"]) * 4
-    # Round for aesthetic purposes
-    total_tokens = int(total_tokens)
+    shard_paths = [os.path.join(data_dir, filename) 
+                   for filename in os.listdir(data_dir) 
+                   if filename.endswith(".jsonl.gz")]
+    compressed_sizes = [os.stat(path).st_size for path in shard_paths]
+    size_pairs = []
+    for i in range(3):
+        test_shard_path_idx = random.randrange(len(shard_paths))
+        test_shard_path = shard_paths[test_shard_path_idx]
+        test_shard_size = compressed_sizes[test_shard_path_idx]
+        print(f"Reading {test_shard_path} to estimate compression ratio...") 
+        with gzip.open(test_shard_path, 'rt', encoding='utf-8') as infile:
+            size_pairs.append([test_shard_size, len(infile.read())])
+    compress_ratios = []
+    for compress_size, decompress_size in size_pairs:
+        compress_ratios.append(decompress_size / compress_size)
+    avg_compress_ratio = sum(compress_ratios) / 3
+    estimated_sizes = [avg_compress_ratio * filesize for filesize in compressed_sizes]
+    estimated_total_bytes = sum(estimated_sizes)
+    total_tokens = int(estimated_total_bytes * tokens_per_char * 4)
+    # 350 is average length of pretraining documents according to lore
+    total_docs = int(total_tokens / 350)
     
-    print(f"Processing {total_docs} documents with {total_tokens} tokens...")
+    print(f"Processing an estimated {total_docs} documents with {total_tokens} tokens...")
 
-    dataloader = CommonPileLowCodeLoader(data_dir)
+    dataloader = CommonPileLowCodeLoader(data_dir, start=args.start_after, end=args.end)
     await dataloader.setup()
     
     # Global progress bar for documents
@@ -446,8 +464,8 @@ async def main():
             chunks = process_document(doc, tokens_per_char, rp)
             for chunk in chunks:
                 chunks2rephrase.put(chunk)
-        if chunks2rephrase.qsize() >= 128 and rephrase_jobs.qsize() <= 128:
-            for i in range(32):
+        if chunks2rephrase.qsize() >= 128 and rephrase_jobs.qsize() <= 256:
+            for i in range(64):
                 chunk = chunks2rephrase.get()
                 for template in TEMPLATES:
                     rephrase_jobs.put(
